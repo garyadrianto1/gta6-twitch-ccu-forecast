@@ -7,8 +7,8 @@ the case's hour-1 print and the launch-day curves of past big launches
 
 Model: a local linear regression in ln(hour 1), fitted per hour over the
 comparables. For each comparable launch with a usable release-day curve,
-the log-ratio r_h = ln(viewers_h / viewers_hour1). Two facts drive the
-design, both measured on the kit's practice data:
+the log-ratio r_h = ln(viewers_h / viewers_hour1). Three facts drive the
+design, all measured on the kit's practice data:
 
 1. The afternoon rise is almost entirely explained by hour-1 size
    (correlation -0.90 between ln(hour 1) and the median rise over hours
@@ -24,17 +24,33 @@ design, both measured on the kit's practice data:
    |ln(hour1) - ln(target hour1)| <= 2.0 are used to fit the centre line,
    and only those within <= 1.5 for the residual quantiles, each falling
    back to all comparables when too few are near.
+3. Two band-gated second regressors, each fitted as a two-feature plane
+   (ln hour 1 + feature) where the feature's signal lives:
+   - Big targets (hour 1 > 100k, the GTA VI analogues): the unlock hour
+     from the case's notes / the comparables' unlock research notes —
+     rolling midnight local (0.0) vs a single global unlock time. It
+     separates flat rolling launches from sharp simultaneous ones, which
+     ln(hour 1) alone cannot time. Only ~9 comparables carry a parseable
+     unlock, so the plane needs just 8 points.
+   - Small targets (hour 1 < 10k): the 7-day pre-launch level relative to
+     hour 1 (log ratio), from the case's history / the comparables' hourly
+     data. It separates explosive small launches (quiet before, huge
+     afternoon) from merely small ones; the plane needs 10 points.
+   Mid targets use the one-feature line. A missing feature (unparseable
+   unlock, no pre-launch data) falls back to the one-feature line.
 
-The quantiles are the empirical quantiles of those local residuals, so the
-spread is calibrated to what similar launches actually did instead of a
-fixed sigma. Everything is computed at run time from the case the grader
+The quantiles are the empirical quantiles of those local residuals,
+widened by 1.1 in log units (in-sample residuals underestimate the true
+spread), so the spread is calibrated to what similar launches actually
+did instead of a fixed sigma. Everything is computed at run time from the case the grader
 gives, so the entry adapts to the final case's comparables. Deterministic:
 sorted iteration, no randomness, no network, no wall-clock use.
 
 Validation (leave-one-launch-out over the kit's 37 usable comparables,
-exact pinball loss on the log scale): mean loss 0.385, against 0.930 for
-the house baseline (starter) — a 59% improvement; on big launches (hour 1
-above 100k, the GTA VI analogues) 0.210 against the baseline's 0.261.
+exact pinball loss on the log scale): mean loss 0.333, against 0.385 for
+the previous entry (E7) and 0.930 for the house baseline (starter) — a
+64% improvement over the baseline; on big launches (hour 1 above 100k,
+the GTA VI analogues) 0.188 against the baseline's 0.261 and E7's 0.210.
 
 How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
 python:3.13-slim, standard library only: no network, no pip packages.
@@ -60,6 +76,7 @@ stand in for /input and /output:
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -89,6 +106,104 @@ MIN_RESIDUALS = 5
 CENTRE_WINDOW = 2.0
 # Local window (in ln(hour1)) for the residual quantiles.
 SPREAD_WINDOW = 1.5
+
+# The residual quantiles are empirical quantiles of in-sample residuals,
+# which underestimate the true spread; widen them by 1.1 in log units.
+# LOLO: 1.0 -> 0.3361, 1.1 -> 0.3335, 1.2 -> 0.3327, 1.3 -> 0.3331, but
+# the big-launch band starts degrading past 1.1, so 1.1 keeps it at its
+# best (0.1882) while fixing most of the narrow tails.
+SPREAD_MULT = 1.1
+
+# Band boundaries (natural log of hour-1 viewers): the same bands the
+# ledger reports. Big launches (hour 1 > 100k) are the GTA VI analogues;
+# small launches (hour 1 < 10k) are the explosive ones.
+BIG_BAND = 11.512925  # ln(100000)
+SMALL_BAND = 9.210340  # ln(10000)
+
+
+def parse_unlock(text):
+    """Unlock hour (hours after day_start 00:00Z) from free text, or None.
+
+    Rolling midnight local -> 0.0 (already unlocking by 00:00Z in the
+    earliest zones). A specific global unlock time (ISO timestamp) -> its
+    UTC hour. Early-access-contaminated or unverified -> None (no signal).
+    Checks rolling before any timestamp, because a rolling note also names
+    the first (New Zealand) unlock time.
+    """
+    if not text or not isinstance(text, str):
+        return None
+    t = text.lower()
+    if "early access" in t or "early-access" in t:
+        return None
+    if "rolling" in t or "midnight local" in t:
+        return 0.0
+    m = re.search(r"\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})Z", text)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / 60.0
+    return None
+
+
+def prelaunch_ratio(day_start, points, hours):
+    """Mean viewers in the `hours` before day_start, divided by hour-1 viewers.
+
+    `points` is a list of {"at"/"from": iso, "viewers": n}. Returns None when
+    there are no usable pre-launch points. The caller divides by h1; this
+    returns the raw mean so the caller can take the log-ratio.
+    """
+    if day_start is None:
+        return None
+    vals = []
+    for p in points or []:
+        at = p.get("at") or p.get("from")
+        try:
+            t = datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        v = p.get("viewers")
+        if v is None or v < 1:
+            continue
+        if day_start - timedelta(hours=hours) <= t < day_start:
+            vals.append(v)
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def fit_line2(points, min_points=8):
+    """Least-squares plane r = a + b*x + c*u over (x, u, r) points, or None.
+
+    Solved by Gaussian elimination on the 3x3 normal equations. Needs at
+    least min_points points (3 parameters, and the local window thins the
+    data).
+    """
+    n = len(points)
+    if n < min_points:
+        return None
+    # Normal equations: M @ [a, b, c] = v, with rows [1, x, u].
+    M = [[0.0] * 3 for _ in range(3)]
+    v = [0.0] * 3
+    for x, u, r in points:
+        row = [1.0, x, u]
+        for i in range(3):
+            v[i] += row[i] * r
+            for j in range(3):
+                M[i][j] += row[i] * row[j]
+    # Gaussian elimination with partial pivoting.
+    A = [M[i] + [v[i]] for i in range(3)]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda k: abs(A[k][col]))
+        if abs(A[piv][col]) < 1e-12:
+            return None
+        A[col], A[piv] = A[piv], A[col]
+        for k in range(col + 1, 3):
+            f = A[k][col] / A[col][col]
+            for j in range(col, 4):
+                A[k][j] -= f * A[col][j]
+    sol = [0.0] * 3
+    for i in (2, 1, 0):
+        s = A[i][3] - sum(A[i][j] * sol[j] for j in range(i + 1, 3))
+        sol[i] = s / A[i][i]
+    return tuple(sol)
 
 
 def round2(x: float) -> float | int:
@@ -214,6 +329,62 @@ def forecast_case(case, name):
     x_target = math.log(p1)
 
     points = regression_points(case.get("comparables"))
+    # Two second-regressor features, one per band where it helps:
+    #   big targets (hour 1 > 100k): the unlock hour — rolling midnight
+    #     (0.0) vs a single global unlock time. It separates the flat
+    #     rolling launches from the sharp simultaneous ones, which ln(hour 1)
+    #     alone cannot time.
+    #   small targets (hour 1 < 10k): the 7-day pre-launch level relative
+    #     to hour 1 (log ratio) — it separates explosive small launches
+    #     (quiet before, huge afternoon) from merely small ones.
+    # Mid targets use the E7 one-feature line. Either feature falling back
+    # to None (unparseable / no pre-launch data) also falls back to E7.
+    u_unlock_target = parse_unlock(case.get("notes"))
+    try:
+        ds_target = datetime.fromisoformat(case["day_start"].replace("Z", "+00:00"))
+    except (KeyError, ValueError, AttributeError):
+        ds_target = None
+    pre_target = prelaunch_ratio(ds_target, case.get("history"), 24 * 7)
+    u_pre_target = (math.log(pre_target / p1)
+                    if pre_target is not None and pre_target > 0 else None)
+    # Per-comparable feature values, computed once.
+    u_unlock_comp = {}
+    u_pre_comp = {}
+    for comp in case.get("comparables") or []:
+        u_unlock_comp[id(comp)] = parse_unlock(comp.get("unlock"))
+        try:
+            ds = datetime.fromisoformat(comp["day_start"].replace("Z", "+00:00"))
+        except (KeyError, ValueError, AttributeError):
+            ds = None
+        curve = day_curve(comp)
+        h1c = curve[0]
+        pre = prelaunch_ratio(ds, comp.get("hourly"), 24 * 7)
+        u_pre_comp[id(comp)] = (math.log(pre / h1c)
+                                if pre and h1c and pre > 0 else None)
+
+    def two_feature_points(u_comp):
+        """Per hour, (ln h1, feature, log-ratio) for comparables that have
+        the feature; same usability filter as regression_points."""
+        out = {h: [] for h in range(2, 25)}
+        for comp in case.get("comparables") or []:
+            u = u_comp.get(id(comp))
+            if u is None:
+                continue
+            curve = day_curve(comp)
+            h1c = curve[0]
+            if not h1c or h1c < 1:
+                continue
+            if sum(1 for v in curve[1:24] if v is not None) < MIN_DAY_HOURS:
+                continue
+            x = math.log(h1c)
+            for h in range(2, 25):
+                v = curve[h - 1]
+                if v is not None and v >= 1:
+                    out[h].append((x, u, math.log(v / h1c)))
+        return out
+
+    points2u = two_feature_points(u_unlock_comp)
+    points2p = two_feature_points(u_pre_comp)
     # Centre and residual spreads per hour.
     centre = {}
     spreads = {}
@@ -228,7 +399,38 @@ def forecast_case(case, name):
         if len(near_centre) >= MIN_REGRESSION_POINTS:
             fit_pts = near_centre
         line = fit_line(fit_pts)
-        if line is None:
+        # Band-gated second regressor: a two-feature plane (ln h1 +
+        # feature) where the feature is available for the target and the
+        # band; otherwise the one-feature line.
+        line2 = None
+        pts2 = None
+        u_t = None
+        min_pts = 8
+        if x_target >= BIG_BAND and u_unlock_target is not None:
+            pts2 = points2u[h]
+            u_t = u_unlock_target
+            min_pts = 8  # only ~9 classified launches exist; 8 is the floor
+        elif x_target < SMALL_BAND and u_pre_target is not None:
+            pts2 = points2p[h]
+            u_t = u_pre_target
+            min_pts = 10  # pre-launch data exists for all launches; prefer
+            # the global fit over a thin local one
+        if pts2 is not None:
+            near2 = [p for p in pts2 if abs(p[0] - x_target) <= CENTRE_WINDOW]
+            cand = near2 if len(near2) >= min_pts else pts2
+            line2 = fit_line2(cand, min_pts)
+        if line2 is not None:
+            a, b, c = line2
+            rs = sorted(r for _, r in pts)
+            centre[h] = min(max(a + b * x_target + c * u_t, rs[0]), rs[-1])
+            residuals = sorted(r - (a + b * x + c * u) for x, u, r in pts2)
+            # Heteroscedastic spread: launches near the target's hour-1
+            # size have a much tighter residual spread than far ones.
+            near = sorted(r - (a + b * x + c * u) for x, u, r in pts2
+                          if abs(x - x_target) <= SPREAD_WINDOW)
+            if len(near) >= MIN_RESIDUALS:
+                residuals = near
+        elif line is None:
             # Too few points for a line: fall back to the median curve.
             med = quantile(sorted(r for _, r in pts), 0.5)
             centre[h] = med
@@ -244,7 +446,7 @@ def forecast_case(case, name):
                           if abs(x - x_target) <= SPREAD_WINDOW)
             if len(near) >= MIN_RESIDUALS:
                 residuals = near
-        spreads[h] = [quantile(residuals, tau) for tau in LEVELS]
+        spreads[h] = [quantile(residuals, tau) * SPREAD_MULT for tau in LEVELS]
     if not centre:
         # No usable comparables at all: fall back to the house baseline.
         return {"hours": [{"hour": row["hour"], "q": persistence_quantiles(p1, row["hour"])}
